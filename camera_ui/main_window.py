@@ -56,15 +56,15 @@ class MainWindow(QMainWindow):
         self.class_names = ["Background", "Monolayer", "Fewlayer", "Multilayer"]
         self.class_colors_np = np.array([
             [0, 0, 0],          # Background
-            [239, 41, 41],      # Monolayer — 红
+            [255, 200, 0],      # Monolayer — 黄
             [0, 170, 0],        # Fewlayer — 绿
-            [114, 159, 207],    # Multilayer — 蓝
+            [160, 32, 240],     # Multilayer — 紫
         ], dtype=np.uint8)
         self.class_colors = [
             QColor(0, 0, 0),
-            QColor(239, 41, 41),
+            QColor(255, 200, 0),
             QColor(0, 170, 0),
-            QColor(114, 159, 207),
+            QColor(160, 32, 240),
         ]
 
         # 推理参数
@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         self.frame_count = 0
         self.fps_start_time = time.time()
         self.current_fps = 0.0
+        self._inference_latency_ms = 0.0   # 最近一次推理延时 (ms)
 
         # 图像增强参数
         self.enhance_sharpen = 0.0   # USM 锐化强度 0~3.0
@@ -91,6 +92,13 @@ class MainWindow(QMainWindow):
 
         # 字体缩放因子 (1.0 = 默认, 可动态调整)
         self._font_scale = 1.0
+
+        # 物镜倍率 (用于比例尺计算)
+        self.objective_mag = 50           # 当前物镜倍率
+        self._pixel_pitch_base_um = 2.4  # 传感器原始像元尺寸 (µm), L3CMOS05100KPA
+        self._pixel_pitch_um = 2.4       # 有效像元尺寸 (µm), 随 binning 自动更新
+        # 分辨率 → binning 倍率映射 (索引对应 combo_res)
+        self._binning_table = {0: 1, 1: 2, 2: 4}  # 2560x1922→1x, 1280x960→2x, 640x480→4x
 
         # 视频录制
         self._recording = False
@@ -244,16 +252,19 @@ class MainWindow(QMainWindow):
         self.lbl_status_title.setStyleSheet("color:#999; font-size:13px; font-weight:bold; border:none;")
         status_inner.addWidget(self.lbl_status_title)
 
-        # 状态行1: FPS Exp Gain AWB
+        # 状态行1: FPS Latency Exp AWB
         s_row1 = QHBoxLayout()
         s_row1.setSpacing(20)
         self.lbl_fps = QLabel("FPS: --")
         self.lbl_fps.setStyleSheet("color:#e0e0e0; border:none; font-size:15px; font-weight:bold;")
+        self.lbl_latency = QLabel("Latency: --")
+        self.lbl_latency.setStyleSheet("color:#f0c040; border:none; font-size:15px; font-weight:bold;")
         self.lbl_expo_info = QLabel("Exp: --")
         self.lbl_expo_info.setStyleSheet("color:#e0e0e0; border:none; font-size:15px;")
         self.lbl_awb_status = QLabel("AWB: OFF")
         self.lbl_awb_status.setStyleSheet("color:#e0e0e0; border:none; font-size:15px;")
         s_row1.addWidget(self.lbl_fps)
+        s_row1.addWidget(self.lbl_latency)
         s_row1.addWidget(self.lbl_expo_info)
         s_row1.addWidget(self.lbl_awb_status)
         s_row1.addStretch()
@@ -381,7 +392,18 @@ class MainWindow(QMainWindow):
         gain_row.addWidget(self.lbl_gain)
         gain_row.addWidget(self.slider_gain, 1)
         gain_row.addWidget(self.spin_gain)
-        gain_row.addStretch()
+        gain_row.addSpacing(12)
+        # 物镜倍率选择 (用于保存时比例尺)
+        lbl_mag = QLabel("Objective:")
+        lbl_mag.setStyleSheet("color:#ccc; border:none; font-size:14px;")
+        self.combo_mag = QComboBox()
+        self.combo_mag.addItems(["5×", "20×", "50×"])
+        self.combo_mag.setCurrentText("50×")
+        self.combo_mag.setStyleSheet("font-size:13px;")
+        self.combo_mag.setMinimumWidth(60)
+        self.combo_mag.currentTextChanged.connect(self._on_mag_changed)
+        gain_row.addWidget(lbl_mag)
+        gain_row.addWidget(self.combo_mag)
         ctrl_inner.addLayout(gain_row)
 
         self.info_splitter.addWidget(ctrl_box)
@@ -538,6 +560,7 @@ class MainWindow(QMainWindow):
         self.spin_temp.setRange(TOUPCAM_TEMP_MIN, TOUPCAM_TEMP_MAX)
         self.spin_temp.setValue(TOUPCAM_TEMP_DEF)
         self.spin_temp.setFixedWidth(70)
+        self.spin_temp.setKeyboardTracking(False)  # 输入完成后才触发
         self.spin_temp.valueChanged.connect(self._on_temp_spin)
         temp_row.addWidget(self.slider_temp, 1)
         temp_row.addWidget(self.spin_temp)
@@ -553,6 +576,7 @@ class MainWindow(QMainWindow):
         self.spin_tint.setRange(TOUPCAM_TINT_MIN, TOUPCAM_TINT_MAX)
         self.spin_tint.setValue(TOUPCAM_TINT_DEF)
         self.spin_tint.setFixedWidth(70)
+        self.spin_tint.setKeyboardTracking(False)  # 输入完成后才触发
         self.spin_tint.valueChanged.connect(self._on_tint_spin)
         tint_row.addWidget(self.slider_tint, 1)
         tint_row.addWidget(self.spin_tint)
@@ -700,6 +724,12 @@ class MainWindow(QMainWindow):
                   'fewlayer': '仅 Fewlayer', 'multilayer': '仅 Multilayer'}
         self.statusBar().showMessage(f"显示模式: {labels.get(self.display_filter, text)}")
 
+    def _on_mag_changed(self, text):
+        """切换物镜倍率 (影响保存时的比例尺)"""
+        mag = int(text.replace('×', ''))
+        self.objective_mag = mag
+        self.statusBar().showMessage(f"物镜倍率: {mag}×")
+
     def _on_font_scale_changed(self, value):
         """动态调整全局字体大小 (50%~200%)"""
         self._font_scale = value / 100.0
@@ -715,6 +745,7 @@ class MainWindow(QMainWindow):
         # 更新状态标签
         for lbl in [self.lbl_fps, self.lbl_expo_info, self.lbl_awb_status]:
             lbl.setStyleSheet(f"color:#e0e0e0; border:none; font-size:{status_size}px; font-weight:bold;")
+        self.lbl_latency.setStyleSheet(f"color:#f0c040; border:none; font-size:{status_size}px; font-weight:bold;")
         self.lbl_model_info.setStyleSheet(f"color:#e07030; border:none; font-size:{status_size}px;")
         self.lbl_resolution.setStyleSheet(f"color:#8ae68a; border:none; font-size:{status_size}px;")
 
@@ -931,8 +962,12 @@ class MainWindow(QMainWindow):
                 self.frame_count = 0
                 self.fps_start_time = time.time()
 
-    def _on_inference_result(self, frame, mask, conf_map):
+    def _on_inference_result(self, frame, mask, conf_map, latency_ms):
         """接收后台推理线程的结果，在 UI 线程做叠加和显示"""
+        self._inference_latency_ms = latency_ms
+        self._last_frame = frame       # 保存原始帧供简洁导出用
+        self._last_pred_mask = mask
+        self._last_conf_map = conf_map
         result_img = self._overlay_mask(frame, mask, conf_map)
         self.detection_result = result_img
         self.detection_view.set_image(result_img)
@@ -947,6 +982,11 @@ class MainWindow(QMainWindow):
         # 更新 Info 标签
         self.lbl_resolution.setText(f"Resolution: {self.camera.width}x{self.camera.height}")
         self.lbl_fps.setText(f"FPS: {self.current_fps:.1f}")
+        # 推理延时
+        if self._inference_latency_ms > 0:
+            self.lbl_latency.setText(f"Latency: {self._inference_latency_ms:.0f} ms")
+        else:
+            self.lbl_latency.setText("Latency: --")
 
         expo_ms = self.camera.expo_time_us / 1000.0
         mode_str = "Auto" if self.camera.auto_expo else "Manual"
@@ -969,20 +1009,22 @@ class MainWindow(QMainWindow):
             self.slider_gain.blockSignals(False)
             self.spin_gain.blockSignals(False)
 
-        # 同步白平衡
-        self.slider_temp.blockSignals(True)
-        self.spin_temp.blockSignals(True)
-        self.slider_temp.setValue(self.camera.temp)
-        self.spin_temp.setValue(self.camera.temp)
-        self.slider_temp.blockSignals(False)
-        self.spin_temp.blockSignals(False)
+        # 同步白平衡 (跳过正在编辑的控件)
+        if not self.spin_temp.hasFocus():
+            self.slider_temp.blockSignals(True)
+            self.spin_temp.blockSignals(True)
+            self.slider_temp.setValue(self.camera.temp)
+            self.spin_temp.setValue(self.camera.temp)
+            self.slider_temp.blockSignals(False)
+            self.spin_temp.blockSignals(False)
 
-        self.slider_tint.blockSignals(True)
-        self.spin_tint.blockSignals(True)
-        self.slider_tint.setValue(self.camera.tint)
-        self.spin_tint.setValue(self.camera.tint)
-        self.slider_tint.blockSignals(False)
-        self.spin_tint.blockSignals(False)
+        if not self.spin_tint.hasFocus():
+            self.slider_tint.blockSignals(True)
+            self.spin_tint.blockSignals(True)
+            self.slider_tint.setValue(self.camera.tint)
+            self.spin_tint.setValue(self.camera.tint)
+            self.slider_tint.blockSignals(False)
+            self.spin_tint.blockSignals(False)
 
     # ────────────────────────────────────────────────────────────
     #   控件回调
@@ -1058,6 +1100,9 @@ class MainWindow(QMainWindow):
             self.camera.set_temp_tint(self.camera.temp, val)
 
     def _on_resolution_changed(self, idx):
+        # 根据 binning 倍率自动更新有效像元尺寸
+        binning = self._binning_table.get(idx, 1)
+        self._pixel_pitch_um = self._pixel_pitch_base_um * binning
         if self.camera_running:
             self._stop_camera()
             self.combo_res.setCurrentIndex(idx)
@@ -1084,8 +1129,8 @@ class MainWindow(QMainWindow):
         from PyQt5.QtCore import QThread as _QThread, pyqtSignal as _Signal
 
         class _ModelLoader(_QThread):
-            finished = _Signal(object, str)  # (model, epoch_info)
-            failed = _Signal(str)            # error message
+            model_ready = _Signal(object, str)   # (model, epoch_info)
+            model_failed = _Signal(str)           # error message
 
             def __init__(self, path, variant, device, parent=None):
                 super().__init__(parent)
@@ -1130,15 +1175,15 @@ class MainWindow(QMainWindow):
                         model.load_state_dict(ckpt, strict=False)
 
                     model.eval()
-                    self.finished.emit(model, epoch_info)
+                    self.model_ready.emit(model, epoch_info)
                 except Exception as e:
-                    self.failed.emit(str(e))
+                    self.model_failed.emit(str(e))
 
         loader = _ModelLoader(path, self.model_variant, self.device, parent=self)
-        loader.finished.connect(lambda model, info: self._on_model_loaded(model, path, info))
-        loader.failed.connect(self._on_model_load_error)
+        loader.model_ready.connect(lambda model, info: self._on_model_loaded(model, path, info))
+        loader.model_failed.connect(self._on_model_load_error)
+        # 用 QThread 内置的 finished 信号做清理，确保线程真正结束后再 deleteLater
         loader.finished.connect(loader.deleteLater)
-        loader.failed.connect(loader.deleteLater)
         self._model_loader = loader  # 保持引用防止 GC
         loader.start()
 
@@ -1213,6 +1258,7 @@ class MainWindow(QMainWindow):
             frame, mask, conf_map, self.class_names, self.class_colors_np,
             visible_classes=visible, alpha=alpha
         )
+        self._last_detection_counts = detection_counts  # 保存供导出用
 
         # 更新底部 GUI 摘要栏
         if detection_counts:
@@ -1234,12 +1280,168 @@ class MainWindow(QMainWindow):
 
 
     # ────────────────────────────────────────────────────────────
+    #   比例尺绘制
+    # ────────────────────────────────────────────────────────────
+
+    def _draw_scale_bar(self, img):
+        """在图像右下角绘制比例尺 (白色横线 + 标注文字)"""
+        h, w = img.shape[:2]
+        um_per_px = self._pixel_pitch_um / self.objective_mag  # µm/pixel
+
+        # 自动选择合适的比例尺长度
+        # 目标: 比例尺长度为图像宽度的 8%
+        target_px = w * 0.08
+        target_um = target_px * um_per_px
+        # 取整到 "好看" 的数值: 1, 2, 5, 10, 20, 50, 100, 200, 500...
+        nice_vals = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
+        bar_um = min(nice_vals, key=lambda v: abs(v - target_um))
+        bar_px = int(bar_um / um_per_px)
+
+        # 标签
+        if bar_um >= 1000:
+            label = f"{bar_um/1000:.0f} mm"
+        elif bar_um >= 1:
+            label = f"{bar_um:.0f} um"
+        else:
+            label = f"{bar_um*1000:.0f} nm"
+
+        # 绘制位置: 右下角，留 margin
+        margin = int(min(w, h) * 0.03)
+        bar_thickness = max(5, int(h * 0.006))  # 加粗
+        font_scale_val = max(0.8, h / 800.0)
+        font_thickness = max(2, int(font_scale_val * 3))
+
+        x2 = w - margin
+        x1 = x2 - bar_px
+        # 比例尺底部与左下角层数面板对齐 (底端 = h - margin)
+        bg_pad_bottom = 16
+        y_bar = h - margin - bg_pad_bottom - bar_thickness
+
+        out = img.copy()
+
+        # 画半透明黑色背景 (与左下角层数统计一致)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale_val, font_thickness)
+        bg_x1 = x1 - 16
+        bg_y1 = y_bar - th - int(margin * 1.2)
+        bg_x2 = x2 + 16
+        bg_y2 = h - margin
+        sub = out[bg_y1:bg_y2, bg_x1:bg_x2]
+        if sub.size > 0:
+            bg = np.zeros_like(sub)
+            out[bg_y1:bg_y2, bg_x1:bg_x2] = cv2.addWeighted(sub, 0.35, bg, 0.65, 0)
+
+        # 画白色比例尺横线
+        cv2.line(out, (x1, y_bar), (x2, y_bar), (255, 255, 255), bar_thickness)
+
+        # 画文字标签 (居中于比例尺上方)
+        text_x = x1 + (bar_px - tw) // 2
+        text_y = y_bar - bar_thickness - 6
+        cv2.putText(out, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale_val, (255, 255, 255), font_thickness, cv2.LINE_AA)
+
+        return out
+
+    def _draw_perf_info(self, img):
+        """在图像右上角绘制 FPS + Latency 标注"""
+        h, w = img.shape[:2]
+        out = img.copy()
+
+        # 构建文本
+        parts = []
+        if self.current_fps > 0:
+            parts.append(f"FPS: {self.current_fps:.1f}")
+        if self._inference_latency_ms > 0:
+            parts.append(f"Latency: {self._inference_latency_ms:.0f} ms")
+        if not parts:
+            return out
+        text = "  |  ".join(parts)
+
+        # 自适应字体
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = max(0.8, h / 800.0)
+        thickness = max(2, int(font_scale * 3))
+        (tw, th_txt), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+        # 右上角，留 margin
+        margin = int(min(w, h) * 0.03)
+        pad = 6
+        x2 = w - margin
+        x1 = x2 - tw - pad * 2
+        y1 = margin
+        y2 = y1 + th_txt + pad * 2
+
+        # 半透明黑色背景
+        sub = out[y1:y2, x1:x2]
+        if sub.size > 0:
+            bg = np.zeros_like(sub)
+            out[y1:y2, x1:x2] = cv2.addWeighted(sub, 0.35, bg, 0.65, 0)
+
+        # 白色文字
+        text_x = x1 + pad
+        text_y = y1 + th_txt + pad
+        cv2.putText(out, text, (text_x, text_y), font,
+                    font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        return out
+
+    # ────────────────────────────────────────────────────────────
     #   保存
     # ────────────────────────────────────────────────────────────
+
+    def _ask_save_mode(self):
+        """弹出导出模式选择对话框，返回 'clean' / 'full' / None"""
+        from PyQt5.QtWidgets import QMessageBox
+        msg = QMessageBox(self)
+        msg.setWindowTitle("导出模式")
+        msg.setText("请选择导出模式:")
+        msg.setInformativeText(
+            "• 简洁模式: 只保留检测框+标签，另存性能指标到 .txt\n"
+            "• 完整模式: 包含比例尺、FPS/Latency、层数统计"
+        )
+        btn_clean = msg.addButton("简洁模式", QMessageBox.AcceptRole)
+        btn_full = msg.addButton("完整模式", QMessageBox.AcceptRole)
+        msg.addButton("取消", QMessageBox.RejectRole)
+        msg.setStyleSheet("QMessageBox { background: #2b2b2b; color: #eee; }"
+                          "QPushButton { min-width: 80px; padding: 6px 12px; }")
+        msg.exec_()
+        clicked = msg.clickedButton()
+        if clicked == btn_clean:
+            return 'clean'
+        elif clicked == btn_full:
+            return 'full'
+        return None
+
+    def _save_metadata(self, img_path):
+        """将 FPS、Latency、检测统计写入同名 .txt 文件"""
+        import os
+        base, _ = os.path.splitext(img_path)
+        txt_path = base + ".txt"
+        lines = [
+            f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"FPS: {self.current_fps:.1f}",
+            f"Inference Latency: {self._inference_latency_ms:.0f} ms",
+            f"Resolution: {self.camera.width}x{self.camera.height}",
+        ]
+        # 模型信息
+        lines.append(f"Model: {self.lbl_model_info.text()}")
+        # 检测统计
+        counts = getattr(self, '_last_detection_counts', {})
+        if counts:
+            lines.append("Detection Counts:")
+            for name, cnt in counts.items():
+                lines.append(f"  {name}: {cnt}")
+        else:
+            lines.append("Detection Counts: None")
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        return txt_path
 
     def _save_image(self):
         if self.current_frame is None:
             self.statusBar().showMessage("没有可保存的图像")
+            return
+        mode = self._ask_save_mode()
+        if mode is None:
             return
         default_name = f"capture_{int(time.time())}.png"
         path, _ = QFileDialog.getSaveFileName(
@@ -1247,12 +1449,24 @@ class MainWindow(QMainWindow):
             "PNG Files (*.png);;TIFF Files (*.tiff *.tif);;BMP Files (*.bmp);;All Files (*)"
         )
         if path:
-            cv2.imwrite(path, self.current_frame)
-            self.statusBar().showMessage(f"图像已保存: {path}")
+            if mode == 'full':
+                save_img = self._draw_scale_bar(self.current_frame)
+                save_img = self._draw_perf_info(save_img)
+            else:
+                save_img = self.current_frame.copy()
+            cv2.imwrite(path, save_img)
+            if mode == 'clean':
+                txt = self._save_metadata(path)
+                self.statusBar().showMessage(f"图像已保存: {path} + {os.path.basename(txt)}")
+            else:
+                self.statusBar().showMessage(f"图像已保存: {path}")
 
     def _save_result(self):
         if self.detection_result is None:
             self.statusBar().showMessage("没有检测结果可保存")
+            return
+        mode = self._ask_save_mode()
+        if mode is None:
             return
         default_name = f"result_{int(time.time())}.png"
         path, _ = QFileDialog.getSaveFileName(
@@ -1260,8 +1474,33 @@ class MainWindow(QMainWindow):
             "PNG Files (*.png);;TIFF Files (*.tiff *.tif);;BMP Files (*.bmp);;All Files (*)"
         )
         if path:
-            cv2.imwrite(path, self.detection_result)
-            self.statusBar().showMessage(f"检测结果已保存: {path}")
+            if mode == 'full':
+                save_img = self._draw_scale_bar(self.detection_result)
+                save_img = self._draw_perf_info(save_img)
+            else:
+                # 简洁模式: 重新生成不带层数统计的overlay
+                frame = getattr(self, '_last_frame', None)
+                mask = getattr(self, '_last_pred_mask', None)
+                conf = getattr(self, '_last_conf_map', None)
+                if frame is not None and mask is not None:
+                    filter_map = {
+                        'full': None, 'monolayer': {1},
+                        'fewlayer': {2}, 'multilayer': {3},
+                    }
+                    visible = filter_map.get(self.display_filter)
+                    save_img, _ = overlay_mask(
+                        frame, mask, conf, self.class_names,
+                        self.class_colors_np, visible_classes=visible,
+                        draw_stats=False
+                    )
+                else:
+                    save_img = self.detection_result.copy()
+            cv2.imwrite(path, save_img)
+            if mode == 'clean':
+                txt = self._save_metadata(path)
+                self.statusBar().showMessage(f"检测结果已保存: {path} + {os.path.basename(txt)}")
+            else:
+                self.statusBar().showMessage(f"检测结果已保存: {path}")
 
     # ────────────────────────────────────────────────────────────
     #   视频录制
