@@ -56,15 +56,15 @@ class MainWindow(QMainWindow):
         self.class_names = ["Background", "Monolayer", "Fewlayer", "Multilayer"]
         self.class_colors_np = np.array([
             [0, 0, 0],          # Background
-            [255, 200, 0],      # Monolayer — 黄
-            [0, 170, 0],        # Fewlayer — 绿
-            [160, 32, 240],     # Multilayer — 紫
+            [253, 174, 97],     # Monolayer — #FDAE61 (橙黄)
+            [116, 173, 209],    # Fewlayer — #74ADD1 (浅蓝)
+            [69, 117, 180],     # Multilayer — #4575B4 (深蓝)
         ], dtype=np.uint8)
         self.class_colors = [
             QColor(0, 0, 0),
-            QColor(255, 200, 0),
-            QColor(0, 170, 0),
-            QColor(160, 32, 240),
+            QColor(253, 174, 97),
+            QColor(116, 173, 209),
+            QColor(69, 117, 180),
         ]
 
         # 推理参数
@@ -397,7 +397,7 @@ class MainWindow(QMainWindow):
         lbl_mag = QLabel("Objective:")
         lbl_mag.setStyleSheet("color:#ccc; border:none; font-size:14px;")
         self.combo_mag = QComboBox()
-        self.combo_mag.addItems(["5×", "20×", "50×"])
+        self.combo_mag.addItems(["10×", "20×", "50×"])
         self.combo_mag.setCurrentText("50×")
         self.combo_mag.setStyleSheet("font-size:13px;")
         self.combo_mag.setMinimumWidth(60)
@@ -928,7 +928,11 @@ class MainWindow(QMainWindow):
     # ────────────────────────────────────────────────────────────
 
     def _on_timer(self):
-        """主定时器 — 从后台线程获取最新帧并显示"""
+        """主定时器 — 从后台线程获取最新帧并显示。
+
+        面试重点: UI 主线程没有直接拉相机、没有直接跑模型。
+        它只定时读取 CameraController 缓存的最新帧，然后把帧交给显示控件或推理线程。
+        """
         if not self.camera_running:
             return
 
@@ -936,14 +940,15 @@ class MainWindow(QMainWindow):
         frame = self.camera.get_latest_frame()
         if frame is not None:
             self.current_frame = frame.copy()
-            # 应用图像增强
+            # 图像增强只影响显示和录制，不默认改变模型输入，避免训练/推理分布偏移。
             display_frame = self._apply_enhancements(frame)
             self.camera_view.set_image(display_frame)
 
             # 如果有新 ROI 待应用，在这里发送给相机
             self._apply_pending_roi()
 
-            # 连续检测模式 (异步推理，不阻塞 UI)
+            # 连续检测模式 (异步推理，不阻塞 UI)。
+            # submit_frame 内部采用“最新帧覆盖旧帧”，避免推理队列越积越长。
             if self.continuous_detect and self.model is not None:
                 self._inference_worker.submit_frame(frame)
 
@@ -963,7 +968,11 @@ class MainWindow(QMainWindow):
                 self.fps_start_time = time.time()
 
     def _on_inference_result(self, frame, mask, conf_map, latency_ms):
-        """接收后台推理线程的结果，在 UI 线程做叠加和显示"""
+        """接收后台推理线程的结果，在 UI 线程做叠加和显示。
+
+        模型线程只返回原图、mask、置信度图和耗时；
+        颜色叠加、连通域统计和 Qt 控件更新都放回 UI 线程完成。
+        """
         self._inference_latency_ms = latency_ms
         self._last_frame = frame       # 保存原始帧供简洁导出用
         self._last_pred_mask = mask
@@ -1125,7 +1134,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("正在加载模型...")
         self.btn_load_model.setEnabled(False)  # 防止重复点击
 
-        # 在后台线程加载
+        # 在后台线程加载。权重文件可能有几 MB 到几十 MB，直接在 UI 线程加载会卡窗口。
         from PyQt5.QtCore import QThread as _QThread, pyqtSignal as _Signal
 
         class _ModelLoader(_QThread):
@@ -1150,18 +1159,19 @@ class MainWindow(QMainWindow):
                     from models.repela_net import repela_net_tiny, repela_net_small, repela_net_base, infer_use_cse
                     model_fn = {'tiny': repela_net_tiny, 'small': repela_net_small, 'base': repela_net_base}[self._variant]
 
-                    # 先加载 checkpoint，推断配置
+                    # 先加载 checkpoint，再推断 use_cse/deploy 等结构配置。
+                    # 这样训练产物和 deploy state_dict 都能被同一个 GUI 加载。
                     ckpt = torch.load(self._path, map_location=self._device, weights_only=False)
 
                     if isinstance(ckpt, dict) and 'model' in ckpt:
-                        # 标准 checkpoint (训练产出)
+                        # 标准 checkpoint (训练产出): 通常包含 model、args、epoch 等信息。
                         sd = ckpt['model']
                         use_cse = infer_use_cse(ckpt, cli_use_cse=False)
                         deploy = any('fused_conv' in k for k in sd.keys())
                         epoch = ckpt.get('epoch')
                         epoch_info = f" (Epoch {epoch + 1})" if isinstance(epoch, int) else ""
                     else:
-                        # 原始 state_dict (deploy 导出 或 其他)
+                        # 原始 state_dict (deploy 导出或其他): 通过 key 名推断是否为融合后的 deploy 模型。
                         sd = ckpt if isinstance(ckpt, dict) else {}
                         use_cse = any('color_enhance.s_weight' in k for k in sd.keys())
                         deploy = any('fused_conv' in k for k in sd.keys())
@@ -1221,7 +1231,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("没有可用的图像帧")
             return
 
-        # 切换连续检测模式
+        # 切换连续检测模式。实际推理在 _on_timer 中持续提交帧给后台线程。
         self.continuous_detect = not self.continuous_detect
         if self.continuous_detect:
             # 按钮变为绿色活跃状态 (检测进行中)
@@ -1244,7 +1254,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("连续检测已停止")
 
     def _overlay_mask(self, frame, mask, conf_map=None, alpha=0.35):
-        """将分割 mask 叠加到原图上，并更新 GUI 摘要栏"""
+        """将分割 mask 叠加到原图上，并更新 GUI 摘要栏。
+
+        面试可强调: 底层是语义分割，检测框和层数统计来自 mask 的连通域后处理。
+        """
         # 根据显示过滤模式决定可见类别
         filter_map = {
             'full': None,  # None = 显示所有
@@ -1274,6 +1287,34 @@ class MainWindow(QMainWindow):
             self.lbl_summary_detail.setTextFormat(Qt.RichText)
         else:
             self.lbl_summary_detail.setText("No detections")
+
+        # 将 FPS 和 Latency 直接写入叠加帧 (以供录制证明)
+        h_img, w_img = result.shape[:2]
+        fps_text = f"FPS:{self.current_fps:.1f} | Latency:{self._inference_latency_ms:.0f}ms"
+        font = cv2.FONT_HERSHEY_COMPLEX
+        font_scale = max(0.8, h_img / 800.0)
+        thickness = max(2, int(font_scale * 2.5))
+        (tw, th), _ = cv2.getTextSize(fps_text, font, font_scale, thickness)
+        
+        pad_x, pad_y = 10, 10
+        margin_x = int(w_img * 0.02)
+        
+        x2 = w_img - margin_x
+        x1 = x2 - tw - pad_x * 2
+        y1 = int(h_img * 0.02)
+        y2 = y1 + th + pad_y * 2
+        
+        # 半透明黑色背景
+        sub = result[y1:y2, x1:x2]
+        if sub.size > 0:
+            bg = np.zeros_like(sub)
+            result[y1:y2, x1:x2] = cv2.addWeighted(sub, 0.4, bg, 0.6, 0)
+        
+        # 文字投影和前景
+        text_x = x1 + pad_x
+        text_y = y1 + pad_y + th
+        cv2.putText(result, fps_text, (text_x + 1, text_y + 1), font, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+        cv2.putText(result, fps_text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
         return result
 
@@ -1320,7 +1361,7 @@ class MainWindow(QMainWindow):
         out = img.copy()
 
         # 画半透明黑色背景 (与左下角层数统计一致)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale_val, font_thickness)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_COMPLEX, font_scale_val, font_thickness)
         bg_x1 = x1 - 16
         bg_y1 = y_bar - th - int(margin * 1.2)
         bg_x2 = x2 + 16
@@ -1336,7 +1377,7 @@ class MainWindow(QMainWindow):
         # 画文字标签 (居中于比例尺上方)
         text_x = x1 + (bar_px - tw) // 2
         text_y = y_bar - bar_thickness - 6
-        cv2.putText(out, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(out, label, (text_x, text_y), cv2.FONT_HERSHEY_COMPLEX,
                     font_scale_val, (255, 255, 255), font_thickness, cv2.LINE_AA)
 
         return out

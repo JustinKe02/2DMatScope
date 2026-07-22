@@ -7,6 +7,10 @@ Key features:
   - Lightweight depthwise separable convolution for refinement
   - Boundary-aware enhancement at the final stage
   - Deep supervision with auxiliary heads (optional)
+
+面试抓手:
+  浅层特征分辨率高、边界细节强；深层特征语义强、分辨率低。
+  DW-MFF 用可学习权重决定不同尺度贡献，边界增强模块用于缓解二维材料层间边界模糊。
 """
 
 import torch
@@ -52,7 +56,8 @@ class DynamicWeightedFusion(nn.Module):
         """
         assert len(features) == self.num_inputs
 
-        # Fast normalized fusion weights (always positive via ReLU)
+        # Fast normalized fusion weights (always positive via ReLU)。
+        # 不是固定相加，而是让网络学习“当前尺度更该信浅层还是深层”。
         w = F.relu(self.weights)
         w = w / (w.sum() + self.eps)
 
@@ -93,11 +98,11 @@ class BoundaryEnhancement(nn.Module):
         )
 
     def forward(self, x):
-        # Edge-aware attention
+        # Edge-aware attention: 学习哪些空间位置更像层间边界。
         edge = self.edge_conv(x)
-        # Channel attention
+        # Channel attention: 学习哪些通道对边界判断更重要。
         ca = self.channel_attn(x)
-        # Enhance boundaries
+        # Enhance boundaries: 残差增强，不破坏原始语义特征。
         out = x + x * edge * ca
         return out
 
@@ -199,25 +204,24 @@ class DWMFFDecoder(nn.Module):
         """
         f1, f2, f3, f4 = features
 
-        # Align channels
+        # Align channels: 先把四个 encoder stage 的通道统一到 decoder_channels，
+        # 这样后续融合可以直接做加权求和。
         f4 = self.align4(f4)
         f3 = self.align3(f3)
         f2 = self.align2(f2)
         f1 = self.align1(f1)
 
-        # Fuse F4 + F3
+        # 自顶向下融合: 深层语义逐级上采样，与浅层细节结合。
         f4_up = F.interpolate(f4, size=f3.shape[2:], mode='bilinear', align_corners=False)
         p3 = self.fuse_43([f3, f4_up])
 
-        # Fuse P3 + F2
         p3_up = F.interpolate(p3, size=f2.shape[2:], mode='bilinear', align_corners=False)
         p2 = self.fuse_32([f2, p3_up])
 
-        # Fuse P2 + F1
         p2_up = F.interpolate(p2, size=f1.shape[2:], mode='bilinear', align_corners=False)
         p1 = self.fuse_21([f1, p2_up])
 
-        # Boundary enhancement
+        # 最细尺度处做边界增强，因为最终 mask 的边缘主要由浅层高分辨率特征决定。
         p1 = self.boundary(p1)
 
         # Main segmentation output

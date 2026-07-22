@@ -1,0 +1,9 @@
+Timestamp: 2026-04-05 18:38:15
+FPS: 10.7
+Inference Latency: 1488 ms
+Resolution: 2560x1922
+Model: Model: best_model.pth
+Detection Counts:
+  Monolayer: 1
+  Fewlayer: 1
+  Multilayer: 5

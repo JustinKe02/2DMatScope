@@ -7,6 +7,11 @@ Complete model assembly combining:
   2. RepConv Stages (stages 1-2, local features)
   3. ELA Stages (stages 3-4, global features)
   4. DW-MFF Decoder (dynamic weighted multi-scale fusion)
+
+面试抓手:
+  - 前两层用 RepConv 抓颜色/纹理等局部细节，推理可融合成单分支卷积。
+  - 后两层用 ELA 在低分辨率特征上做轻量全局建模，避免全图 Transformer 过重。
+  - Decoder 用动态多尺度融合和边界增强，针对二维材料区域尺度差异大、边界模糊的问题。
 """
 
 import torch
@@ -119,7 +124,9 @@ class RepELANet(nn.Module):
         -> DW-MFF Decoder (128x128x4)
         -> Upsample (512x512x4)
     
-    Target: <3M params, <2G FLOPs @512x512
+    面试口径:
+        这是一个轻量级语义分割网络，不是目标检测网络。
+        输出是每个像素的类别 logits，GUI 里的检测框来自 mask 后处理。
     """
 
     def __init__(self, num_classes=4, channels=(32, 64, 128, 256),
@@ -146,13 +153,14 @@ class RepELANet(nn.Module):
         self.num_classes = num_classes
         c1, c2, c3, c4 = channels
 
-        # Input channel expansion: 3ch RGB -> 4ch
+        # Input channel expansion: 3ch RGB -> 4ch。
+        # use_cse=True 时第 4 通道是 HSV 饱和度；默认用 0 填充以保持结构一致。
         if use_cse:
             self.color_enhance = ColorSpaceEnhancement(norm_mean=norm_mean, norm_std=norm_std)
         else:
             self.color_enhance = ZeroPadChannel()
 
-        # Stem: initial downsampling (4x4 -> 1/4 resolution)
+        # Stem: 初始降采样 + 局部纹理提取，先把高分辨率图压到较低计算量。
         self.stem = nn.Sequential(
             nn.Conv2d(4, c1, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(c1),
@@ -162,33 +170,31 @@ class RepELANet(nn.Module):
             nn.GELU(),
         )
 
-        # Stage 1: RepConv (1/4 -> 1/8)
+        # Stage 1/2: RepConv 更擅长浅层局部纹理，适合材料显微图中的颜色和边缘细节。
         self.stage1 = RepConvStage(
             c1, c1, num_blocks=num_blocks[0],
             expand_ratio=2, use_se=True, deploy=deploy
         )
 
-        # Stage 2: RepConv (1/8 -> 1/16)
         self.stage2 = RepConvStage(
             c1, c2, num_blocks=num_blocks[1],
             expand_ratio=2, use_se=True, deploy=deploy
         )
 
-        # Stage 3: ELA (1/16 -> 1/32)
+        # Stage 3/4: 在更低分辨率上使用 ELA，引入全局上下文，同时控制计算量。
         self.stage3 = ELAStage(
             c2, c3, num_blocks=num_blocks[2],
             num_heads=num_heads[2], expand_ratio=2,
             drop=drop_rate, attn_drop=0., scales=(1, 2, 4)
         )
 
-        # Stage 4: ELA (1/32 -> 1/64)
         self.stage4 = ELAStage(
             c3, c4, num_blocks=num_blocks[3],
             num_heads=num_heads[3], expand_ratio=2,
             drop=drop_rate, attn_drop=0., scales=(1, 2)
         )
 
-        # Decoder
+        # Decoder: 融合浅层细节和深层语义，输出 4 类语义分割 logits。
         self.decoder = DWMFFDecoder(
             in_channels_list=[c1, c2, c3, c4],
             decoder_channels=decoder_channels,
@@ -222,19 +228,18 @@ class RepELANet(nn.Module):
         """
         input_size = x.shape[2:]
 
-        # Color space enhancement
+        # 3 通道 RGB -> 4 通道输入增强/占位。
         x = self.color_enhance(x)  # [B, 4, H, W]
 
-        # Stem
+        # Encoder: f1/f2 偏细节，f3/f4 偏语义和全局上下文。
         x = self.stem(x)  # [B, C1, H/2, W/2]
 
-        # Encoder stages
         f1 = self.stage1(x)   # [B, C1, H/4, W/4]
         f2 = self.stage2(f1)  # [B, C2, H/8, W/8]
         f3 = self.stage3(f2)  # [B, C3, H/16, W/16]
         f4 = self.stage4(f3)  # [B, C4, H/32, W/32]
 
-        # Decoder
+        # Decoder 输出的空间尺寸通常是 H/4，再上采样回输入原图尺寸。
         decoder_out = self.decoder([f1, f2, f3, f4])
 
         if isinstance(decoder_out, tuple):

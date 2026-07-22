@@ -1,5 +1,10 @@
 """
-CameraController — 封装 Toupcam SDK 的相机控制类
+CameraController — 封装 Toupcam SDK 的相机控制类。
+
+面试抓手:
+1. Toupcam SDK 提供 C 动态库接口，Python 侧用 ctypes 声明函数签名后调用。
+2. SDK callback 只做“有图像事件”的通知，真正拉图放到后台线程，避免阻塞回调。
+3. 相机线程只保存最新帧，UI 定时器读取最新帧；这是实时系统常用的低延迟策略。
 """
 
 import ctypes
@@ -19,7 +24,11 @@ from .sdk_types import (
 
 
 class CameraController:
-    """封装 Toupcam SDK 的相机控制类"""
+    """显微相机控制器。
+
+    这个类把底层 Toupcam C SDK 包成更适合 GUI 调用的 Python 接口：
+    打开/关闭相机、拉帧、曝光增益、白平衡、ROI 和最新帧缓存。
+    """
 
     def __init__(self):
         self.lib = None
@@ -42,7 +51,9 @@ class CameraController:
         self.temp = TOUPCAM_TEMP_DEF
         self.tint = TOUPCAM_TINT_DEF
 
-        # 回调（必须保持引用，防止被 GC）
+        # 回调（必须保持引用，防止被 GC）。
+        # ctypes 回调对象如果只在局部变量里创建，可能被 Python 回收，
+        # SDK 下次回调时会访问失效函数指针，严重时直接崩溃。
         self._event_cb = CALLBACK_TYPE(self._on_event)
         self._awb_cb = AWB_TT_CALLBACK_TYPE(self._on_awb)
 
@@ -55,6 +66,8 @@ class CameraController:
         self._last_read_seq = -1        # 上次读取的帧序号
 
     def _on_event(self, event, ctx):
+        # SDK 回调里只设置标志位，不做拉图/图像处理等重操作。
+        # 这样可以减少 SDK 回调线程被阻塞的风险。
         if event == TOUPCAM_EVENT_IMAGE:
             self.image_ready = True
         elif event == TOUPCAM_EVENT_DISCONNECTED:
@@ -68,7 +81,8 @@ class CameraController:
         """打开相机"""
         self.lib = ctypes.CDLL(DLL_PATH)
 
-        # 基础函数签名
+        # 声明 C SDK 函数签名。ctypes 调 C 接口时，argtypes/restype 很关键：
+        # 指针、宽字符字符串、回调类型写错，轻则返回错误，重则进程崩溃。
         self.lib.Toupcam_EnumV2.restype = c_uint
         self.lib.Toupcam_Open.restype = c_void_p
         self.lib.Toupcam_Open.argtypes = [c_wchar_p]
@@ -100,7 +114,7 @@ class CameraController:
         self.lib.Toupcam_put_AWBAuxRect.argtypes = [c_void_p, POINTER(RECT)]
         self.lib.Toupcam_get_AWBAuxRect.argtypes = [c_void_p, POINTER(RECT)]
 
-        # 枚举相机
+        # 枚举相机: 拿到 display name 和 id；真正打开设备要用 id。
         devices = (ToupcamInstV2 * TOUPCAM_MAX)()
         count = self.lib.Toupcam_EnumV2(devices)
         if count == 0:
@@ -108,12 +122,12 @@ class CameraController:
 
         camera_name = devices[0].displayname
 
-        # 打开相机
+        # 打开相机句柄；后续所有 SDK 调用都围绕这个 handle。
         self.handle = self.lib.Toupcam_Open(devices[0].id)
         if not self.handle:
             raise RuntimeError("无法打开相机！")
 
-        # 设置分辨率
+        # 设置相机输出分辨率，不是对图像做软件 resize。
         self.lib.Toupcam_put_eSize(self.handle, resolution_index)
 
         w, h = c_int(), c_int()
@@ -140,7 +154,8 @@ class CameraController:
         self.lib.Toupcam_put_AutoExpoEnable(self.handle, 1)
         self.auto_expo = True
 
-        # 开始捕获
+        # Pull mode + callback:
+        # callback 通知“有新图”，后台线程再调用 PullImage 主动取图。
         result = self.lib.Toupcam_StartPullModeWithCallback(self.handle, self._event_cb, None)
         if result != 0:
             raise RuntimeError(f"启动捕获失败: {result}")
@@ -163,7 +178,7 @@ class CameraController:
             return None
         self.image_ready = False
 
-        # 使用 32-bit BGRA 模式拉取以获取更好的色彩质量
+        # 使用 32-bit BGRA 模式拉取；之后转成 OpenCV 常用的 BGR。
         bufsize = self.width * self.height * 4
         buf = (c_ubyte * bufsize)()
         pw, ph = c_uint(), c_uint()
@@ -199,7 +214,10 @@ class CameraController:
         self._grabber_thread = None
 
     def _grabber_loop(self):
-        """后台线程: 不停轮询 pull_frame(), 将最新帧存入 _latest_frame"""
+        """后台线程: 不停轮询 pull_frame(), 将最新帧存入 _latest_frame。
+
+        这里不维护无限队列。实时观察场景里，处理当前帧比补算历史帧更有价值。
+        """
         while self._grabber_running and self.connected:
             frame = self.pull_frame()
             if frame is not None:

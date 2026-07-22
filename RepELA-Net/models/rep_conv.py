@@ -4,6 +4,10 @@ Inspired by RepViT (CVPR 2024) and UniRepLKNet (CVPR 2024).
 
 Training: Multi-branch topology (3x3 Conv + 1x1 Conv + Identity + BN)
 Inference: Merged into a single 3x3 Conv (zero extra cost)
+
+面试抓手:
+  训练时多分支增强表达能力；部署时把 Conv+BN、1x1 分支和 identity 分支
+  等价融合成一个 3x3 卷积，所以推理阶段没有额外分支开销。
 """
 
 import torch
@@ -70,7 +74,13 @@ class RepConvBN(nn.Module):
         return out
 
     def _fuse_bn(self, conv, bn):
-        """Fuse Conv and BatchNorm into a single Conv with bias."""
+        """Fuse Conv and BatchNorm into a single Conv with bias.
+
+        面试公式:
+            W' = W * gamma / sqrt(var + eps)
+            b' = beta - mean * gamma / sqrt(var + eps)
+        融合后卷积本身带 bias，推理时就不需要单独 BN。
+        """
         kernel = conv.weight
         gamma = bn.weight
         beta = bn.bias
@@ -91,7 +101,11 @@ class RepConvBN(nn.Module):
             raise ValueError(f"Unsupported kernel size: {self.kernel_size}")
 
     def _get_identity_kernel_bias(self):
-        """Get equivalent kernel and bias for identity + BN branch."""
+        """Get equivalent kernel and bias for identity + BN branch.
+
+        identity 也可以看成中心点为 1 的 3x3 卷积核，再按 BN 参数融合。
+        这就是为什么三个分支最后可以直接把 weight/bias 相加。
+        """
         assert self.identity is not None
         kernel = torch.zeros(
             self.out_channels, self.in_channels // self.groups,
@@ -115,7 +129,11 @@ class RepConvBN(nn.Module):
         return fused_weight, fused_bias
 
     def switch_to_deploy(self):
-        """Convert from training mode to deploy mode (fuse all branches)."""
+        """Convert from training mode to deploy mode (fuse all branches).
+
+        这一步通常在导出/部署前做。完成后模型结构从“训练友好”
+        变成“推理友好”，功能等价但图里只剩一个 fused_conv。
+        """
         if self.deploy:
             return
 
@@ -126,7 +144,7 @@ class RepConvBN(nn.Module):
         w1, b1 = self._fuse_bn(self.conv1x1[0], self.conv1x1[1])
         w1 = self._pad_1x1_to_3x3(w1)
 
-        # Merge all branches
+        # Merge all branches: 多分支的输出相加，等价卷积核和 bias 也相加。
         fused_weight = w3 + w1
         fused_bias = b3 + b1
 

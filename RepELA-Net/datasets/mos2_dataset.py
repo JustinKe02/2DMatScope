@@ -30,12 +30,17 @@ class MoS2Dataset(Dataset):
 
     Classes:
         0: background, 1: monolayer, 2: fewlayer, 3: multilayer
+
+    面试抓手:
+        这是语义分割数据集，mask 像素值就是类别 id。
+        单层/少层像素占比很低，所以训练时需要 crop、颜色增强和 CopyPaste 缓解类别不均衡。
     """
 
     MEAN = [0.485, 0.456, 0.406]
     STD = [0.229, 0.224, 0.225]
     CLASSES = ['background', 'monolayer', 'fewlayer', 'multilayer']
-    # Inverse-frequency weights (bg:74.86%, mono:3.12%, few:2.46%, multi:19.56%)
+    # Inverse-frequency weights (bg:74.86%, mono:3.12%, few:2.46%, multi:19.56%)。
+    # 少数类权重大，配合 Focal/Dice 让模型不要只学背景和多层。
     CLASS_WEIGHTS = [0.15, 3.60, 4.56, 0.57]
 
     def __init__(self, data_root, split='train', split_dir='splits/',
@@ -151,7 +156,8 @@ class MoS2Dataset(Dataset):
         donor_img = Image.open(donor_img_path).convert('RGB')
         donor_mask = np.array(Image.open(donor_mask_path))
 
-        # Bias toward fewlayer (70%) since it's the weakest class
+        # Bias toward fewlayer (70%) since it's the weakest class。
+        # 面试可以说: 这是数据层面对少数类/难类的定向增强。
         target_class = 2 if random.random() < 0.7 else 1
         class_mask = (donor_mask == target_class)
 

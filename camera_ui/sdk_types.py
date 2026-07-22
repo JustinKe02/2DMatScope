@@ -62,6 +62,8 @@ class ToupcamInstV2(Structure):
         ("model", POINTER(ToupcamModelV2))
     ]
 
+
+#定义矩形结构体，用于自动曝光roi和自动白平衡roi
 class RECT(Structure):
     _fields_ = [
         ("left", c_int), ("top", c_int),

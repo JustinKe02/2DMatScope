@@ -288,8 +288,13 @@ def sliding_window_predict(model, img_tensor, crop_size, stride, device,
     """Sliding window inference on a single full-res image.
 
     For smp models, each crop is padded to a multiple of 32.
+
+    面试抓手:
+        训练阶段使用 512 crop，验证/部署时对整张显微图做滑窗。
+        重叠区域用概率平均，避免窗口边界处直接覆盖带来的拼接痕迹。
     """
     _, H, W = img_tensor.shape
+    # 累加每个 crop 的类别概率，并记录每个像素被覆盖次数。
     pred_sum = torch.zeros(num_classes, H, W, dtype=torch.float32, device=device)
     count = torch.zeros(H, W, dtype=torch.float32, device=device)
 
@@ -299,6 +304,7 @@ def sliding_window_predict(model, img_tensor, crop_size, stride, device,
         img_tensor = F.pad(img_tensor, [0, pad_w, 0, pad_h], mode='reflect')
 
     _, pH, pW = img_tensor.shape
+    # 加入最后一个起点，保证图像右边界和下边界也被完整覆盖。
     y_pos = sorted(set(
         list(range(0, max(1, pH - crop_size + 1), stride)) +
         [max(0, pH - crop_size)]
@@ -330,6 +336,7 @@ def sliding_window_predict(model, img_tensor, crop_size, stride, device,
 
             y_end = min(y + crop_size, H)
             x_end = min(x + crop_size, W)
+            # 对重叠区域累加 softmax 概率，最后除以 count 做平均。
             pred_sum[:, y:y_end, x:x_end] += probs[:, :y_end-y, :x_end-x]
             count[y:y_end, x:x_end] += 1
 
@@ -508,7 +515,11 @@ def validate(model, val_loader, criterion, device, args, has_deep_sup, is_smp):
 # ═══════════════════════════════════════════════════════════════════════
 
 def train_single(args):
-    """Train a single model configuration."""
+    """Train a single model configuration.
+
+    面试口径: 这里体现了完整训练闭环，包括固定随机种子、构建模型、加载数据、
+    Focal+Dice loss、AdamW+cosine schedule、AMP、验证滑窗、保存 best 和 deploy 权重。
+    """
     # Seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -545,7 +556,7 @@ def train_single(args):
         num_workers=args.num_workers, copy_paste=args.copy_paste,
     )
 
-    # Loss
+    # Loss: Focal 处理类别不均衡/难样本，Dice 关注分割区域重叠。
     criterion = HybridLoss(
         num_classes=args.num_classes,
         focal_alpha=MoS2Dataset.CLASS_WEIGHTS,
@@ -554,7 +565,7 @@ def train_single(args):
         boundary_weight=args.boundary_weight,
     ).to(device)
 
-    # Optimizer & scheduler
+    # Optimizer & scheduler: AdamW + warmup cosine 是小数据视觉训练中常用的稳妥组合。
     optimizer = optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(
@@ -598,7 +609,8 @@ def train_single(args):
             model, train_loader, criterion, optimizer, scaler,
             device, args, has_deep_sup, is_smp, logger, ema)
 
-        # Validate (always use original model — EMA weights are for deploy only)
+        # Validate (always use original model — EMA weights are for deploy only)。
+        # 验证时采用 full image 滑窗，指标更贴近真实显微图部署场景。
         val_res = validate(model, val_loader, criterion, device,
                            args, has_deep_sup, is_smp)
 
@@ -664,7 +676,7 @@ def train_single(args):
     logger.info('=' * 80)
     logger.info(f'Done. Best mIoU: {best_miou:.4f}')
 
-    # Deploy model (RepELA-Net only)
+    # Deploy model (RepELA-Net only): 将 RepConv 多分支融合成单分支，保存给 GUI/部署端加载。
     if args.model in REPELA_MODELS and (not args.ablation or args.ablation == 'with_cse'):
         try:
             # Use EMA weights for deploy if available

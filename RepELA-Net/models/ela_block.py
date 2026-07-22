@@ -7,6 +7,10 @@ Key features:
   - Q pooling at multiple scales to capture multi-scale features
   - Depthwise Conv for local feature extraction
   - Lightweight FFN with DWConv
+
+面试抓手:
+  标准 self-attention 对高分辨率图像是 O(N^2)，这里用线性 attention
+  降到近似 O(N)，并只放在深层低分辨率特征上，兼顾全局上下文和实时性。
 """
 
 import torch
@@ -49,7 +53,8 @@ class MultiScaleLinearAttention(nn.Module):
         phi(x) = elu(x) + 1 (ensures non-negative)
         Attn = phi(Q) @ (phi(K)^T @ V) / (phi(Q) @ sum(phi(K)))
         """
-        # Force float32 for numerical stability under AMP
+        # Force float32 for numerical stability under AMP。
+        # attention 累加量较大，半精度下更容易出现数值不稳定。
         q = q.float()
         k = k.float()
         v = v.float()
@@ -61,7 +66,7 @@ class MultiScaleLinearAttention(nn.Module):
         q = F.elu(q) + 1  # non-negative feature map
         k = F.elu(k) + 1
 
-        # (phi(K)^T @ V): [B, H, D, D]
+        # 先算 (phi(K)^T @ V)，再左乘 phi(Q)，避免构造 N x N 注意力矩阵。
         kv = torch.einsum('bhnd,bhne->bhde', k, v)
         # phi(Q) @ (phi(K)^T @ V): [B, H, N, D]
         qkv = torch.einsum('bhnd,bhde->bhne', q, kv)
@@ -85,7 +90,8 @@ class MultiScaleLinearAttention(nn.Module):
         # Multi-scale attention
         scale_weights = F.softmax(self.scale_weights, dim=0)
 
-        # Full resolution attention (always computed)
+        # Full resolution attention (always computed)。
+        # 后续 pooled Q 分支提供更大感受野，相当于让模型同时看局部和更大尺度上下文。
         out = scale_weights[0] * self._linear_attention(q, k, v)
 
         # Pooled Q scales for larger receptive fields

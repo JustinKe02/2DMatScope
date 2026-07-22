@@ -2,6 +2,9 @@
 Evaluation Metrics for Semantic Segmentation.
 
 Includes: mIoU, per-class IoU, pixel accuracy, F1 score.
+
+面试抓手:
+  Pixel Acc 容易被背景像素占比“抬高”；mIoU 和 mean F1 更能反映单层/少层等少数类效果。
 """
 
 import numpy as np
@@ -12,6 +15,9 @@ class SegmentationMetrics:
     """Compute semantic segmentation metrics.
     
     Maintains a confusion matrix and computes metrics from it.
+
+    confusion_matrix[row, col] 表示真实类别 row 被预测成 col 的像素数量。
+    所有指标都可以从这张表推出来，便于统一统计 train/val/test。
     """
 
     def __init__(self, num_classes):
@@ -43,6 +49,7 @@ class SegmentationMetrics:
     def get_iou(self):
         """Compute per-class IoU and mIoU."""
         intersection = np.diag(self.confusion_matrix)
+        # IoU = TP / (TP + FP + FN)，语义分割里比整体像素准确率更关键。
         union = (
             self.confusion_matrix.sum(axis=1) +
             self.confusion_matrix.sum(axis=0) -

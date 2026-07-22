@@ -9,6 +9,11 @@ Class distribution:
   multilayer: 19.56%
   monolayer:   3.12%
   fewlayer:    2.46%
+
+面试抓手:
+  - Focal Loss 降低大量易分类背景像素的权重，强调难样本和少数类。
+  - Dice Loss 直接优化区域重叠，对分割任务和类别不均衡更友好。
+  - Boundary Loss 可选，用来额外约束层间边界。
 """
 
 import torch
@@ -20,6 +25,9 @@ class FocalLoss(nn.Module):
     """Focal Loss for handling class imbalance.
     
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    面试口径: p_t 越大说明样本越容易，(1-p_t)^gamma 越小，
+    于是背景这类易样本不会主导训练。
     
     Numerically stable implementation that works under AMP (float16).
     """
@@ -83,6 +91,8 @@ class DiceLoss(nn.Module):
     """Dice Loss for handling class imbalance.
     
     Numerically stable implementation that works under AMP (float16).
+
+    面试口径: Dice 看的是预测区域和真实区域的重叠，不会像 Pixel Acc 那样被背景像素轻易“刷高”。
     """
 
     def __init__(self, smooth=1.0, ignore_index=255):
@@ -123,7 +133,8 @@ class DiceLoss(nn.Module):
 
         dice = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
 
-        # Average over classes (skip background for better performance)
+        # Average over classes (skip background for better performance)。
+        # 二维材料任务里背景占比很高，跳过背景能让 loss 更关注真正的材料层数区域。
         loss = 1.0 - dice[1:].mean()  # skip class 0 (background)
         return loss
 
